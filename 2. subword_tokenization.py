@@ -223,7 +223,7 @@ from sklearn.dummy import DummyClassifier
 
 dummy_clf = DummyClassifier(strategy="most_frequent")
 dummy_clf.fit(X_train, y_train)
-print(dummy_clf.score(X_valid, y_valid))
+# print(dummy_clf.score(X_valid, y_valid))
 
 
 # 혼동 행렬
@@ -234,8 +234,8 @@ def plot_confusion_matrix(y_preds, y_true, labels):
     fig, ax = plt.subplots(figsize=(6, 6))
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
     disp.plot(cmap="Blues", values_format=".2f", ax=ax, colorbar=False)
-    # plt.title("Normalized confusion matrix")
-    # plt.show()
+    plt.title("Normalized confusion matrix")
+    plt.show()
     
 y_preds = lr_clf.predict(X_valid)
 plot_confusion_matrix(y_preds, y_valid, labels)
@@ -243,3 +243,110 @@ plot_confusion_matrix(y_preds, y_valid, labels)
 
 
 """트랜스포머 미세 튜닝"""
+
+# 사전 훈련 모델 로드
+from transformers import AutoModelForSequenceClassification
+
+num_labels = 6
+model = (AutoModelForSequenceClassification.from_pretrained(model_ckpt, num_labels=num_labels).to(device))
+
+# 성공 지표 정의
+from sklearn.metrics import accuracy_score, f1_score
+
+def compute_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    f1 = f1_score(labels, preds, average="weighted")
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1}
+
+# 모델 훈련
+import os
+from huggingface_hub import HfFolder
+
+# Hugging Face API 토큰 설정
+os.environ["HF_TOKEN"] = "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"  # Hugging Face API 토큰
+HfFolder.save_token(os.getenv("HF_TOKEN"))
+
+from transformers import Trainer, TrainingArguments
+
+batch_size = 64
+logging_steps = len(emotions_encoded["train"]) // batch_size
+model_name = f"{model_ckpt}-finetuned-emotion"
+training_args = TrainingArguments(output_dir=model_name, num_train_epochs=2, learning_rate=2e-5,
+                                  per_device_train_batch_size=batch_size, per_device_eval_batch_size=batch_size,
+                                  weight_decay=0.01, eval_strategy="epoch", disable_tqdm=False, logging_steps=logging_steps,
+                                  push_to_hub=True, save_strategy="epoch", load_best_model_at_end=True, log_level="error")
+
+trainer = Trainer(model=model, args=training_args, compute_metrics=compute_metrics,
+                  train_dataset=emotions_encoded["train"], eval_dataset=emotions_encoded["validation"], tokenizer=tokenizer)
+
+trainer.train()
+
+# 모델 푸시
+# trainer.push_to_hub() # 주피터에서는 notebook_login()을 사용.
+
+
+
+# 검증 세트 지표 확인
+preds_output = trainer.predict(emotions_encoded["validation"])
+
+# print(preds_output.metrics)
+
+y_preds = np.argmax(preds_output.predictions, axis=1)
+
+plot_confusion_matrix(y_preds, y_valid, labels)
+
+# 오류 분석
+from torch.nn.functional import cross_entropy
+
+def forward_pass_with_label(batch):
+    # 모든 입력 텐서, 모델과 같은 장치로 이동
+    inputs = {k:v.to(device) for k,v in batch.items()
+              if k in tokenizer.model_input_names}
+    
+    with torch.no_grad():
+        output = model(**inputs)
+        pred_label = torch.argmax(output.logits, axis=1)
+        loss = cross_entropy(output.logits, batch["label"].to(device),reduction="none")
+    
+    # 다른 데이터셋 열과 호환되도록 출력을 CPU로 옮김
+    return {"loss": loss.cpu().numpy(), "predicted_label":pred_label.cpu().numpy()}
+
+
+# 데이터셋 파이토치 텐서 변환
+emotions_encoded.set_format("torch", columns=["input_ids","attention_mask", "label"])
+
+# 손실 값 계산
+emotions_encoded["validation"] = emotions_encoded["validation"].map(forward_pass_with_label, batched=True, batch_size=16)
+
+emotions_encoded.set_format("pandas")
+cols = ["text","label","predicted_label", "loss"]
+df_test = emotions_encoded["validation"][:][cols]
+df_test["label"] = df_test["label"].apply(label_int2str)
+df_test["predicted_label"] = (df_test["predicted_label"].apply(label_int2str))
+
+# 데이터셋 특이사항 확인
+# print(df_test.sort_values("loss", ascending=False).head(10))
+
+# print(df_test.sort_values("loss", ascending=True).head(10))
+
+
+# 모델 저장 및 공유
+trainer.push_to_hub(commit_message="Training completed.")
+
+from transformers import pipeline
+
+# 허브 사용자 이름
+model_id = "JEONGHEESIK/distilbert-base-uncased-finetuned-emotion"
+classifier = pipeline("text-classification", model=model_id)
+
+custom_tweet = "I saw a movie today and it was really good."
+preds = classifier(custom_tweet, top_k=None)
+
+preds_sorted = sorted(preds, key=lambda d: d['label'])
+preds_df = pd.DataFrame(preds_sorted)
+plt.bar(labels, 100*preds_df["score"], color='C0')
+plt.title(f'"{custom_tweet}"')
+plt.ylabel("Class probability (%)")
+plt.show()
